@@ -19,6 +19,12 @@ logs/
 .env.*
 !.env.example
 
+# ── 本机对接信息（含内网 IP、管理口令、Key，绝不能提交）──────────────
+对接信息.md
+对接信息*.md
+connection-info*.md
+DEPLOY-NOTES*.md
+
 # ── Node / 编辑器 / 系统 ────────────────────────────────────────────
 node_modules/
 npm-debug.log*
