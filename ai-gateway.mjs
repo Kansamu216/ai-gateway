@@ -6962,6 +6962,22 @@ server.listen(PORT, HOST, () => {
   startAutoCheckinTimer();
 });
 
+/*
+ * 端口被占用要**明确报错退出**，而不是当成未捕获异常。
+ * 未捕获异常在容器里会被 restart 策略反复拉起，日志看不出根因。
+ */
+server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    console.error(`[gateway] ✗ 端口 ${PORT} 已被占用（可能是另一个实例在跑）。`);
+    console.error('  改 AIGW_PORT，或停掉占用该端口的程序。');
+  } else if (err.code === 'EACCES') {
+    console.error(`[gateway] ✗ 无权绑定端口 ${PORT}（1024 以下需要特权）。`);
+  } else {
+    console.error(`[gateway] ✗ 启动失败：${err.message}`);
+  }
+  process.exit(1);
+});
+
 for (const sig of ['SIGINT', 'SIGTERM']) {
   process.on(sig, () => { console.log('\nai-gateway stopped'); process.exit(0); });
 }

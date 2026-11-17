@@ -36,26 +36,36 @@
 
 import { createServer, request as requestImpl } from 'node:http';
 import { request as httpsRequest } from 'node:https';
-import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, statSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash, createDecipheriv, randomBytes, timingSafeEqual, createHmac } from 'node:crypto';
 import { spawn } from 'node:child_process';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const DATA = process.env.WORKBUDDY_DATA_DIR || '/data';
+const DATA = envRaw('DATA_DIR') || '/data';
 const AUTH_PATH = join(DATA, 'auth.json');
 const CONFIG_PATH = join(DATA, 'config.json');
 const USAGE_PATH = join(DATA, 'usage.jsonl');
 
-const PORT = Number(process.env.CONSOLE_PORT || 8792);
-const HOST = process.env.CONSOLE_HOST || '0.0.0.0';
-const BRIDGE_PORT = Number(process.env.WORKBUDDY_PORT || 8790);
-const BRIDGE_URL = `http://127.0.0.1:${BRIDGE_PORT}`;
+const PORT = Number(envRaw('CONSOLE_PORT') || 8792);
+const HOST = envRaw('CONSOLE_HOST') || '0.0.0.0';
+const BRIDGE_PORT = Number(envRaw('PORT') || 8790);
 
 const BRIDGE_SCRIPT = join(HERE, 'ai-gateway.mjs');
 
 mkdirSync(DATA, { recursive: true });
+
+/**
+ * 读一个配置项：优先 `AIGW_*`，回退旧名 `WORKBUDDY_*`。
+ * 与 ai-gateway.mjs 里同名函数保持一致 —— 两个进程共用一套命名约定，
+ * 否则会出现「控制台改了新名、代理还在读旧名」的静默错配。
+ */
+function envRaw(name) {
+  const v = process.env[`AIGW_${name}`];
+  if (v !== undefined && v !== '') return v;
+  return process.env[`WORKBUDDY_${name}`];
+}
 
 /* ── 配置与状态 ──────────────────────────────────────────────────────── */
 
@@ -137,7 +147,7 @@ function bridgeEnv() {
      * 想强制只听回环（例如只让控制台代理、不直接暴露 8790）时，把它设成
      * 127.0.0.1 —— 但那时 client 只能走控制台，控制台目前不做 /v1 转发。
      */
-    WORKBUDDY_HOST: process.env.WORKBUDDY_BIND || '0.0.0.0',
+    WORKBUDDY_HOST: envRaw('BIND') || '0.0.0.0',
     WORKBUDDY_PORT: String(BRIDGE_PORT),
     WORKBUDDY_AUTH_FILE: AUTH_PATH,
     WORKBUDDY_LOCAL_TOKEN: config.bridgeToken,
@@ -154,9 +164,31 @@ function bridgeEnv() {
      */
     WORKBUDDY_MAX_CONCURRENCY: String(config.maxConcurrency ?? 1),
   };
+
+  /*
+   * ⚠️ 端口与数据目录必须由控制台**单向决定**，不能被外层继承值带偏。
+   *
+   * 为什么会有这个坑：这份 env 是从 `process.env` 展开的，而容器里
+   * Dockerfile 设了 `AIGW_PORT=8790` / `AIGW_DATA_DIR=/data`。子进程于是
+   * 同时看到「继承的 AIGW_*」和「我们要传的 WORKBUDDY_*」，而 envRaw
+   * 优先读 AIGW_* —— 外层那个旧值会赢，改端口/改目录静默失效。
+   *
+   * 正确语义：控制台是唯一决策者。它算出的 BRIDGE_PORT / DATA 写进**两种
+   * 前缀**，子进程无论按哪个名字读都得到同一个值，不存在歧义。
+   */
+  env.WORKBUDDY_PORT = String(BRIDGE_PORT);
+  env.AIGW_PORT = String(BRIDGE_PORT);
+  env.WORKBUDDY_DATA_DIR = DATA;
+  env.AIGW_DATA_DIR = DATA;
+
   const keys = config.clientKeys.map((k) => k.key).filter(Boolean);
-  if (keys.length) env.WORKBUDDY_CLIENT_KEYS = keys.join(',');
-  else delete env.WORKBUDDY_CLIENT_KEYS;
+  if (keys.length) {
+    env.WORKBUDDY_CLIENT_KEYS = keys.join(',');
+    env.AIGW_CLIENT_KEYS = keys.join(',');
+  } else {
+    delete env.WORKBUDDY_CLIENT_KEYS;
+    delete env.AIGW_CLIENT_KEYS;
+  }
   return env;
 }
 
@@ -593,6 +625,64 @@ const compareSecret = (a, b) => {
   const y = Buffer.from(String(b));
   return x.length === y.length && timingSafeEqual(x, y);
 };
+
+/*
+ * 登录失败限速 —— 防止局域网内有人把口令穷举出来。
+ *
+ * 为什么必须有：这个控制台默认监听 0.0.0.0，同一局域网内任何人都能访问；
+ * 而个人项目常见的是 6~8 位短口令，无限制重试下几分钟就能撞开。口令一旦
+ * 被破，攻击者能拿到所有 API Key、改配置、甚至替换凭据。
+ *
+ * 策略（按来源 IP 计）：
+ *   · 连续失败 5 次 → 锁 60 秒；之后每次再失败，锁定时长翻倍，上限 15 分钟；
+ *   · 成功登录即清零。
+ * 只锁「登录尝试」，不影响已登录会话 —— 免得自己被自己锁在门外。
+ */
+const LOGIN_MAX_FAILS = 5;
+const LOGIN_LOCK_BASE_MS = 60 * 1000;
+const LOGIN_LOCK_MAX_MS = 15 * 60 * 1000;
+const loginAttempts = new Map();   // ip -> { fails, lockedUntil }
+
+function clientIp(req) {
+  // 本地回环/直连时 remoteAddress 就是真实来源；反代场景依赖 X-Forwarded-For
+  const xf = req.headers['x-forwarded-for'];
+  const first = Array.isArray(xf) ? xf[0] : (typeof xf === 'string' ? xf.split(',')[0] : '');
+  return String(first || req.socket?.remoteAddress || 'unknown').trim();
+}
+
+/** 返回剩余锁定毫秒数；0 表示可以尝试。 */
+function loginLockRemaining(ip) {
+  const rec = loginAttempts.get(ip);
+  if (!rec) return 0;
+  const left = (rec.lockedUntil || 0) - Date.now();
+  return left > 0 ? left : 0;
+}
+
+function recordLoginFailure(ip) {
+  const rec = loginAttempts.get(ip) || { fails: 0, lockedUntil: 0 };
+  rec.fails += 1;
+  if (rec.fails >= LOGIN_MAX_FAILS) {
+    const over = rec.fails - LOGIN_MAX_FAILS;
+    const lock = Math.min(LOGIN_LOCK_BASE_MS * 2 ** over, LOGIN_LOCK_MAX_MS);
+    rec.lockedUntil = Date.now() + lock;
+  }
+  loginAttempts.set(ip, rec);
+}
+
+function clearLoginFailures(ip) {
+  loginAttempts.delete(ip);
+}
+
+// 定期清掉过期记录，避免 Map 无界增长（攻击者可以不断换 IP）
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, rec] of loginAttempts) {
+    if ((rec.lockedUntil || 0) < now - 60 * 60 * 1000 && rec.fails < LOGIN_MAX_FAILS) {
+      loginAttempts.delete(ip);
+    }
+  }
+}, 10 * 60 * 1000).unref?.();
+
 
 /* ── 页面 ────────────────────────────────────────────────────────────── */
 
@@ -1207,6 +1297,17 @@ const server = createServer(async (req, res) => {
     }
 
     if (path === '/api/login' && req.method === 'POST') {
+      // 先看是否处于锁定状态：锁定期内连口令都不比对，直接拒绝
+      const ip = clientIp(req);
+      const locked = loginLockRemaining(ip);
+      if (locked > 0) {
+        const sec = Math.ceil(locked / 1000);
+        const wantsJson0 = (req.headers['content-type'] || '').includes('application/json');
+        if (wantsJson0) {
+          return send(res, 429, { ok: false, error: `尝试过于频繁，请 ${sec} 秒后再试` }, { 'Retry-After': String(sec) });
+        }
+        return send(res, 302, '', { Location: '/?err=' + encodeURIComponent(`尝试过于频繁，请 ${sec} 秒后再试`) });
+      }
       const body = await readBody(req);
       const wantsJson = (req.headers['content-type'] || '').includes('application/json');
       let pwd = '';
@@ -1216,9 +1317,11 @@ const server = createServer(async (req, res) => {
         pwd = new URLSearchParams(body).get('password') || '';
       }
       if (!compareSecret(pwd, config.consolePassword)) {
+        recordLoginFailure(clientIp(req));
         if (wantsJson) return send(res, 401, { ok: false, error: '口令不对' });
         return send(res, 302, '', { Location: '/?err=' + encodeURIComponent('口令不对') });
       }
+      clearLoginFailures(clientIp(req));
       const cookie = `${COOKIE}=${encodeURIComponent(makeSession())}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${7 * 86400}`;
       /*
        * 浏览器原生表单提交（非 JSON）必须**跳转**回首页。
@@ -1380,6 +1483,26 @@ server.listen(PORT, HOST, () => {
   if (!config.consolePassword) {
     console.log('[console] 首次启动，管理口令见上面的日志');
   }
+});
+
+/*
+ * 端口被占用必须**大声失败**。
+ *
+ * 原先没有 error 处理：`EADDRINUSE` 会作为未捕获异常打死整个进程，
+ * 而 Docker 的 restart 策略会反复重启它 —— 用户看到的是「容器一直
+ * healthy 不起来 / 日志空转」，完全猜不到是端口冲突。
+ * 实测踩过：测试控制台与一个已有服务同端口时静默退出，排查了很久。
+ */
+server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    console.error(`[console] ✗ 端口 ${PORT} 已被占用。`);
+    console.error('  改 CONSOLE_PORT / AIGW_CONSOLE_PORT，或停掉占用该端口的程序。');
+  } else if (err.code === 'EACCES') {
+    console.error(`[console] ✗ 无权绑定端口 ${PORT}（1024 以下需要特权）。换个高位端口。`);
+  } else {
+    console.error(`[console] ✗ 控制台启动失败：${err.message}`);
+  }
+  process.exit(1);
 });
 
 const shutdown = async (signal) => {

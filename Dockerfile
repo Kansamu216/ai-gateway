@@ -25,12 +25,12 @@ COPY ai-gateway.mjs ./ai-gateway.mjs
 COPY console.mjs ./console.mjs
 
 ENV NODE_ENV=production \
-    WORKBUDDY_BIND=0.0.0.0 \
-    WORKBUDDY_PORT=8790 \
-    WORKBUDDY_USAGE_FILE=/data/usage.jsonl \
-    CONSOLE_HOST=0.0.0.0 \
-    CONSOLE_PORT=8792 \
-    WORKBUDDY_DATA_DIR=/data \
+    AIGW_BIND=0.0.0.0 \
+    AIGW_PORT=8790 \
+    AIGW_USAGE_FILE=/data/usage.jsonl \
+    AIGW_CONSOLE_HOST=0.0.0.0 \
+    AIGW_CONSOLE_PORT=8792 \
+    AIGW_DATA_DIR=/data \
     TZ=Asia/Shanghai
 
 RUN mkdir -p /data && chown -R node:node /data /app
@@ -41,7 +41,7 @@ EXPOSE 8790 8792
 # 控制台的 / 页面不需要登录也能返回登录框，用它做健康检查最合适：
 # 它同时证明「控制台在跑」和「Node 运行时正常」。
 HEALTHCHECK --interval=30s --timeout=5s --start-period=25s --retries=3 \
-  CMD node -e "fetch('http://127.0.0.1:'+(process.env.CONSOLE_PORT||8792)+'/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+  CMD node -e "fetch('http://127.0.0.1:'+(process.env.AIGW_CONSOLE_PORT||process.env.CONSOLE_PORT||8792)+'/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
 # 入口是控制台：它自己 spawn 桥，并在桥异常退出时退避重启
 CMD ["node", "console.mjs"]
