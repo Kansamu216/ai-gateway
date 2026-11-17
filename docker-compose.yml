@@ -1,0 +1,36 @@
+# =============================================================================
+# workbuddy-nas —— 国内版 WorkBuddy 网关（NAS 部署）
+#
+#   8790 → OpenAI 兼容接口（给客户端用）
+#   8792 → 网页控制台（给自己用，首次启动的口令看日志）
+#
+# 用法：
+#   docker compose up -d --build
+#   docker compose logs -f | grep 口令      # 拿首次生成的管理口令
+#   浏览器打开 http://<NAS的IP>:8792
+# =============================================================================
+services:
+  ai-gateway:
+    build: .
+    image: ai-gateway:local
+    container_name: ai-gateway
+    restart: unless-stopped
+    ports:
+      # 数据面：客户端连这个
+      - "8790:8790"
+      # 管理面：浏览器连这个
+      - "8792:8792"
+    volumes:
+      # 唯一需要持久化的东西：凭据、Key、账本。
+      # 用 bind mount 而不是 named volume —— 出问题时能直接 ls/cat 排查。
+      - ./data:/data
+    environment:
+      TZ: Asia/Shanghai
+      # 只在「要改管理面端口」时才需要动 CONSOLE_PORT；
+      # 其余配置全部在网页里改，不需要重启容器（控制台会自己重启桥）。
+    logging:
+      driver: json-file
+      options:
+        # 桥会打每条请求的模型/消息数（不含对话内容），限制体积免得撑爆 NAS
+        max-size: "10m"
+        max-file: "3"

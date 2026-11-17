@@ -1,0 +1,14 @@
+# 只在构建上下文中排除无关文件，减小镜像层体积。
+# 真正进镜像的只有 Dockerfile 里 COPY 的那两个 .mjs。
+
+.git
+.gitignore
+README.md
+LICENSE
+data/
+*.log
+tools/
+selftest.mjs
+export-auth.mjs
+.env
+.env.*
